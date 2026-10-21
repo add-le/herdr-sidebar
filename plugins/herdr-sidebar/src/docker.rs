@@ -149,6 +149,7 @@ pub fn classify_failure(stderr: &str) -> DockerError {
         "cannot connect to the docker daemon",
         "is the docker daemon running",
         "error during connect",
+        "failed to connect to the docker api",
     ]
     .iter()
     .any(|m| lower.contains(m))
@@ -254,7 +255,12 @@ pub fn start_desktop() -> std::io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ())
+        .map(|mut child| {
+            // Reap the child off-thread so it doesn't linger as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
 }
 
 #[cfg(test)]
