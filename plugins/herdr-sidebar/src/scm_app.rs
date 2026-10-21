@@ -31,12 +31,11 @@ use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
-    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_activity_button,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    ActivityHits, ActivityTab, TitleAction, branch_icon, chrome_button_style, draw_activity_bar,
+    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
+    icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style, set_color_theme,
+    sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -806,10 +805,6 @@ fn row_hit_with_heights(
 /// last draw.
 #[derive(Clone, Copy, Default)]
 struct ClickZones {
-    activity_row: u16,
-    explorer: (u16, u16),
-    search: (u16, u16),
-    source_control: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
     message: Rect,
@@ -945,6 +940,8 @@ pub struct App {
     hovered: Option<usize>,
     body: BodyGeom,
     zones: ClickZones,
+    /// Activity-bar tab zones from the last draw.
+    activity: ActivityHits,
     /// The hover title-bar buttons' click zones from the last draw (empty
     /// while they are hidden).
     title_zones: Vec<(Rect, TitleAction)>,
@@ -1083,6 +1080,7 @@ impl App {
             hovered: None,
             body: BodyGeom::default(),
             zones: ClickZones::default(),
+            activity: ActivityHits::default(),
             title_zones: Vec::new(),
             last_mouse: None,
             mouse_pos: None,
@@ -1808,14 +1806,12 @@ impl App {
         let (x, y) = (mouse.column, mouse.row);
         let z = self.zones;
         if self.merged() {
-            if hits_activity_button(z.explorer, z.activity_row, x, y) {
-                return self.switch_to(View::Explorer);
-            }
-            if hits_activity_button(z.search, z.activity_row, x, y) {
-                return self.open_search(false);
-            }
-            if hits_activity_button(z.source_control, z.activity_row, x, y) {
-                return self.switch_to(View::SourceControl);
+            match self.activity.tab_at(x, y) {
+                Some(ActivityTab::Explorer) => return self.switch_to(View::Explorer),
+                Some(ActivityTab::Search) => return self.open_search(false),
+                Some(ActivityTab::SourceControl) => return self.switch_to(View::SourceControl),
+                // Wired with the Docker view.
+                Some(ActivityTab::Docker) | None => {}
             }
         }
         if hits(z.gear, x, y) {
@@ -4149,95 +4145,25 @@ impl App {
     /// The area is three rows tall — icons on the middle one, one blank
     /// spacer row each side.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
-        // Three rows in the plain pane background; only the ACTIVE icon's
-        // highlight chip extends into the outer rows by a half block — a tall
-        // button with built-in breathing room, no strip container.
-        let outer_top = area.y;
-        let outer_bottom = area.y + 2;
-        let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
-        // Both FA glyphs (folder, code-fork) render two cells wide in the
-        // non-Mono Nerd Font; reserve the second cell in each chip so the
-        // highlights are equal-sized with centered icons.
-        let slack = if self.theme == IconTheme::Material {
-            " "
-        } else {
-            ""
-        };
-        let mut spans = [
-            Span::raw(" "),
-            Span::raw(format!(" {exp_icon}{slack} ")),
-            Span::raw(" "),
-            Span::raw(format!(" {search_icon}{slack} ")),
-            Span::raw(" "),
-            Span::raw(format!(" {git_icon}{slack} ")),
+        let all = [
+            ActivityTab::Explorer,
+            ActivityTab::Search,
+            ActivityTab::SourceControl,
+            ActivityTab::Docker,
         ];
-        // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
-        let mut x = area.x;
-        let mut bounds = Vec::new();
-        for span in &spans {
-            let w = span.width() as u16;
-            bounds.push((x, x + w));
-            x += w;
-        }
-        self.zones.activity_row = area.y;
-        self.zones.explorer = bounds[1];
-        self.zones.search = bounds[3];
-        self.zones.source_control = bounds[5];
-        let hovered = |bounds| {
-            self.mouse_pos
-                .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
-        };
-        let explorer_hovered = hovered(bounds[1]);
-        let search_hovered = hovered(bounds[3]);
-        let git_hovered = hovered(bounds[5]);
-        spans[1].style = activity_button_style(false, explorer_hovered);
-        spans[3].style = activity_button_style(false, search_hovered);
-        spans[5].style = activity_button_style(true, git_hovered);
-        draw_activity_caps(
+        // The Docker tab only exists in the Unified sidebar.
+        let tabs = if self.merged() { &all[..] } else { &all[..3] };
+        let hits = draw_activity_bar(
             frame,
-            bounds[5],
-            outer_top,
-            outer_bottom,
-            palette().selection_bg,
+            area,
+            self.theme,
+            tabs,
+            ActivityTab::SourceControl,
+            true,
+            self.mouse_pos,
         );
-        for (is_hovered, button_bounds) in
-            [(explorer_hovered, bounds[1]), (search_hovered, bounds[3])]
-        {
-            if is_hovered {
-                draw_activity_caps(
-                    frame,
-                    button_bounds,
-                    outer_top,
-                    outer_bottom,
-                    palette().activity_hover_bg,
-                );
-            }
-        }
-        let gear_text = format!(" {} ", gear_icon(self.theme));
-        let gear_w = Span::raw(gear_text.as_str()).width() as u16;
-        let gear_x = area.x + area.width.saturating_sub(gear_w);
-        self.zones.gear = Rect::new(gear_x, outer_top, gear_w, 3);
-        let gear_hovered = self
-            .mouse_pos
-            .is_some_and(|(x, y)| hits(self.zones.gear, x, y));
-        let gear = Span::styled(gear_text, activity_button_style(false, gear_hovered));
-        if gear_hovered {
-            draw_activity_caps(
-                frame,
-                (gear_x, gear_x + gear_w),
-                outer_top,
-                outer_bottom,
-                palette().activity_hover_bg,
-            );
-        }
-
-        let pad = usize::from(area.width)
-            .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(gear_w));
-        let mut line = spans.to_vec();
-        line.push(Span::raw(" ".repeat(pad)));
-        line.push(gear);
-        frame.render_widget(Paragraph::new(Line::from(line)), area);
+        self.zones.gear = hits.gear;
+        self.activity = hits;
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {

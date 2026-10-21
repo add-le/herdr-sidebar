@@ -444,14 +444,197 @@ pub fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height:
     row == pane_height.saturating_sub(1) && column >= pane_width.saturating_sub(4)
 }
 
-/// Theme-matched activity-bar icons: (explorer, search, source control). FA
-/// glyphs render two cells wide in the non-Mono Nerd Font — chips reserve
-/// the second cell (see the activity-bar renderer).
-pub fn activity_icons(theme: IconTheme) -> (&'static str, &'static str, &'static str) {
-    match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{f002}", "\u{f126}"),
-        IconTheme::Emoji => ("📁", "🔍", "🔀"),
+/// The activity-bar tabs, in VS Code order (= the number keys). `Docker` is
+/// only offered in the Unified sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityTab {
+    Explorer,
+    Search,
+    SourceControl,
+    Docker,
+}
+
+impl ActivityTab {
+    fn icon_index(self) -> usize {
+        match self {
+            Self::Explorer => 0,
+            Self::Search => 1,
+            Self::SourceControl => 2,
+            Self::Docker => 3,
+        }
     }
+}
+
+/// Theme-matched activity-bar icons: explorer, search, source control,
+/// docker. FA glyphs render two cells wide in the non-Mono Nerd Font — chips
+/// reserve the second cell (see `draw_activity_bar`).
+pub fn activity_icons(theme: IconTheme) -> [&'static str; 4] {
+    match theme {
+        IconTheme::Material => ["\u{f07b}", "\u{f002}", "\u{f126}", "\u{f308}"],
+        IconTheme::Emoji => ["📁", "🔍", "🔀", "🐳"],
+    }
+}
+
+/// Activity-bar click zones from the last draw: the middle row, the column
+/// range of each tab's chip, and the ⚙ button's rect.
+#[derive(Clone, Debug)]
+pub struct ActivityHits {
+    pub row: u16,
+    pub tabs: Vec<(ActivityTab, (u16, u16))>,
+    pub gear: Rect,
+}
+
+impl Default for ActivityHits {
+    fn default() -> Self {
+        // row = MAX: nothing hit-tests true before the first draw.
+        Self {
+            row: u16::MAX,
+            tabs: Vec::new(),
+            gear: Rect::default(),
+        }
+    }
+}
+
+impl ActivityHits {
+    /// The tab whose highlight (any of its three rows) is at `(x, y)`.
+    pub fn tab_at(&self, x: u16, y: u16) -> Option<ActivityTab> {
+        self.tabs
+            .iter()
+            .find(|(_, bounds)| hits_activity_button(*bounds, self.row, x, y))
+            .map(|(tab, _)| *tab)
+    }
+
+    pub fn gear_hit(&self, x: u16, y: u16) -> bool {
+        hits(self.gear, x, y)
+    }
+}
+
+/// The bar's spans (a spacer before every chip) and the chip column ranges.
+fn activity_spans(
+    area: Rect,
+    theme: IconTheme,
+    tabs: &[ActivityTab],
+) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
+    let icons = activity_icons(theme);
+    // FA glyphs (folder, code-fork, docker) render two cells wide in the
+    // non-Mono Nerd Font; reserve the second cell in each chip so the
+    // highlights are equal-sized with centered icons.
+    let slack = if theme == IconTheme::Material {
+        " "
+    } else {
+        ""
+    };
+    let mut spans = Vec::new();
+    let mut chips = Vec::new();
+    let mut x = area.x;
+    for tab in tabs {
+        let spacer = Span::raw(" ");
+        x += spacer.width() as u16;
+        spans.push(spacer);
+        let chip = Span::raw(format!(" {}{slack} ", icons[tab.icon_index()]));
+        let w = chip.width() as u16;
+        chips.push((x, x + w));
+        x += w;
+        spans.push(chip);
+    }
+    (spans, chips)
+}
+
+fn gear_text(theme: IconTheme) -> String {
+    format!(" {} ", gear_icon(theme))
+}
+
+/// Pure geometry of the activity bar in `area` (three rows tall from
+/// `area.y`, icons on the middle one): hit zones from the actual span widths
+/// (emoji vs nerd-glyph widths differ), the ⚙ at the right edge.
+pub fn activity_layout(
+    area: Rect,
+    theme: IconTheme,
+    tabs: &[ActivityTab],
+    show_gear: bool,
+) -> ActivityHits {
+    let (_, chips) = activity_spans(area, theme, tabs);
+    let gear = if show_gear {
+        let gear_w = Span::raw(gear_text(theme)).width() as u16;
+        let gear_x = area.x + area.width.saturating_sub(gear_w);
+        Rect::new(gear_x, area.y, gear_w, 3)
+    } else {
+        Rect::default()
+    };
+    ActivityHits {
+        row: area.y + 1,
+        tabs: tabs.iter().copied().zip(chips).collect(),
+        gear,
+    }
+}
+
+/// The VS Code activity bar: view-switcher icons plus (optionally) a ⚙
+/// button. The area is three rows tall; the outer rows stay in the pane
+/// background, and only the ACTIVE icon's highlight chip extends into them
+/// by a half block — a tall button with built-in breathing room, no strip
+/// container. Returns the hit zones for the click handlers.
+pub fn draw_activity_bar(
+    frame: &mut Frame,
+    area: Rect,
+    theme: IconTheme,
+    tabs: &[ActivityTab],
+    active: ActivityTab,
+    show_gear: bool,
+    mouse_pos: Option<(u16, u16)>,
+) -> ActivityHits {
+    let outer_top = area.y;
+    let outer_bottom = area.y + 2;
+    let hits_out = activity_layout(area, theme, tabs, show_gear);
+    let area = Rect::new(area.x, area.y + 1, area.width, 1);
+    let (mut spans, _) = activity_spans(area, theme, tabs);
+    for (i, (tab, bounds)) in hits_out.tabs.iter().enumerate() {
+        let is_active = *tab == active;
+        let hovered = mouse_pos.is_some_and(|(x, y)| hits_activity_button(*bounds, area.y, x, y));
+        spans[i * 2 + 1].style = activity_button_style(is_active, hovered);
+        if is_active {
+            draw_activity_caps(
+                frame,
+                *bounds,
+                outer_top,
+                outer_bottom,
+                palette().selection_bg,
+            );
+        } else if hovered {
+            draw_activity_caps(
+                frame,
+                *bounds,
+                outer_top,
+                outer_bottom,
+                palette().activity_hover_bg,
+            );
+        }
+    }
+    let mut gear_w = 0;
+    let mut gear_span = None;
+    if show_gear {
+        let gear = hits_out.gear;
+        gear_w = gear.width;
+        let hovered = mouse_pos.is_some_and(|(x, y)| hits(gear, x, y));
+        if hovered {
+            draw_activity_caps(
+                frame,
+                (gear.x, gear.x + gear.width),
+                outer_top,
+                outer_bottom,
+                palette().activity_hover_bg,
+            );
+        }
+        gear_span = Some(Span::styled(
+            gear_text(theme),
+            activity_button_style(false, hovered),
+        ));
+    }
+    let pad = usize::from(area.width)
+        .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(gear_w));
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(gear_span);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    hits_out
 }
 
 /// Theme-matched ⚙ settings glyph.
@@ -797,6 +980,40 @@ mod tests {
         let idle = activity_button_style(false, false);
         assert!(idle.add_modifier.contains(Modifier::DIM));
         assert!(idle.bg.is_none());
+    }
+
+    #[test]
+    fn activity_layout_places_four_tabs_in_order_and_the_gear_at_the_edge() {
+        use ActivityTab::*;
+        let hits = activity_layout(
+            Rect::new(0, 0, 32, 3),
+            IconTheme::Material,
+            &[Explorer, Search, SourceControl, Docker],
+            true,
+        );
+        assert_eq!(hits.row, 1);
+        let order: Vec<_> = hits.tabs.iter().map(|(t, _)| *t).collect();
+        assert_eq!(order, [Explorer, Search, SourceControl, Docker]);
+        let (start, end) = hits.tabs[3].1;
+        assert!(end <= 32 - hits.gear.width, "docker chip overlaps the gear");
+        assert_eq!(hits.tab_at(start, 1), Some(Docker));
+        assert_eq!(hits.tab_at(start, 0), Some(Docker)); // all three highlight rows
+        assert_eq!(hits.gear.x + hits.gear.width, 32);
+        assert!(hits.gear_hit(31, 1));
+    }
+
+    #[test]
+    fn activity_layout_without_docker_has_three_tabs() {
+        use ActivityTab::*;
+        let hits = activity_layout(
+            Rect::new(0, 0, 32, 3),
+            IconTheme::Emoji,
+            &[Explorer, Search, SourceControl],
+            false,
+        );
+        assert_eq!(hits.tabs.len(), 3);
+        assert_eq!(hits.tab_at(30, 1), None);
+        assert!(!hits.gear_hit(31, 1));
     }
 
     #[test]
