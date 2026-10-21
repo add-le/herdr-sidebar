@@ -1,6 +1,8 @@
 //! Docker model: parse `docker ps` output and group containers by compose project.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ContainerState {
@@ -133,9 +135,173 @@ pub fn short_image(image: &str) -> String {
         .to_string()
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DockerError {
+    NotInstalled,
+    DaemonDown,
+    Failed(String),
+}
+
+/// Map a failed docker command's stderr to a [`DockerError`].
+pub fn classify_failure(stderr: &str) -> DockerError {
+    let lower = stderr.to_lowercase();
+    if [
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
+        "error during connect",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+    {
+        return DockerError::DaemonDown;
+    }
+    let first = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    DockerError::Failed(first.to_string())
+}
+
+/// First `docker` on `path_var`, then well-known install locations.
+pub fn docker_bin_in(
+    path_var: Option<&str>,
+    home: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let from_path = path_var
+        .into_iter()
+        .flat_map(|p| p.split(':'))
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join("docker"));
+    let fallbacks = home
+        .map(|h| h.join(".docker/bin/docker"))
+        .into_iter()
+        .chain([
+            PathBuf::from("/usr/local/bin/docker"),
+            PathBuf::from("/opt/homebrew/bin/docker"),
+        ]);
+    from_path.chain(fallbacks).find(|p| exists(p))
+}
+
+pub fn docker_bin() -> Option<PathBuf> {
+    let path = std::env::var("PATH").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    docker_bin_in(path.as_deref(), home.as_deref(), Path::is_file)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Action {
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::Restart => "Restart",
+        }
+    }
+}
+
+pub fn action_args(action: Action, ids: &[String]) -> Vec<String> {
+    std::iter::once(action.verb().to_string())
+        .chain(ids.iter().cloned())
+        .collect()
+}
+
+fn exec(args: &[String]) -> Result<String, DockerError> {
+    let bin = docker_bin().ok_or(DockerError::NotInstalled)?;
+    let out = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| DockerError::Failed(e.to_string()))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(classify_failure(&String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// All containers (running or not). Blocks; call from a worker thread.
+pub fn list() -> Result<Vec<Container>, DockerError> {
+    let args = ["ps", "-a", "--format", PS_FORMAT].map(String::from);
+    exec(&args).map(|out| parse_ps(&out))
+}
+
+/// Start/stop/restart containers. Blocks; call from a worker thread.
+pub fn run(action: Action, ids: &[String]) -> Result<(), DockerError> {
+    exec(&action_args(action, ids)).map(|_| ())
+}
+
+/// Launch Docker Desktop without waiting for it to finish starting.
+pub fn start_desktop() -> std::io::Result<()> {
+    Command::new("open")
+        .args(["-a", "Docker"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_errors_are_classified_as_daemon_down() {
+        for s in [
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            "error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/containers/json\": EOF",
+        ] {
+            assert!(
+                matches!(classify_failure(s), DockerError::DaemonDown),
+                "{s}"
+            );
+        }
+        assert!(matches!(
+            classify_failure("\nError response from daemon: No such container: x\n"),
+            DockerError::Failed(m) if m == "Error response from daemon: No such container: x"
+        ));
+    }
+
+    #[test]
+    fn docker_bin_falls_back_to_known_locations() {
+        let home = Path::new("/Users/me");
+        let only = |want: &'static str| move |p: &Path| p == Path::new(want);
+        assert_eq!(
+            docker_bin_in(
+                Some("/usr/bin:/bin"),
+                Some(home),
+                only("/Users/me/.docker/bin/docker")
+            ),
+            Some(PathBuf::from("/Users/me/.docker/bin/docker"))
+        );
+        assert_eq!(
+            docker_bin_in(Some("/x:/y"), Some(home), only("/y/docker")),
+            Some(PathBuf::from("/y/docker"))
+        );
+        assert_eq!(docker_bin_in(None, None, |_| false), None);
+    }
+
+    #[test]
+    fn action_args_put_the_verb_first() {
+        let ids = vec!["a1".to_string(), "c3".to_string()];
+        assert_eq!(action_args(Action::Stop, &ids), ["stop", "a1", "c3"]);
+    }
 
     const PS: &str = "a1\tda-mongo\tmongo:7.0.43\texited\tExited (255) 4 weeks ago\ts3pweb-border-engine\n\
 b2\ts3pweb-redis-stack\tredis/redis-stack:latest\trunning\tUp 50 minutes\t\n\
