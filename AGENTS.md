@@ -1168,6 +1168,26 @@ build sequences programmatically (`[char]27`, or JSON `\u001b` via a params file
 `herdr_ipc.py` pattern: open `\\.\pipe\<HERDR_SOCKET_PATH>` from Python; PS 5.1's
 FileStream refuses pipe paths).
 
+## Docker view (fork `add-le/herdr-sidebar`)
+
+- A 4th activity-bar tab in the Unified sidebar only (`src/docker_app.rs`; Docker CLI calls in
+  `src/docker.rs`). Design: `docs/superpowers/specs/2026-10-21-docker-view-design.md`.
+- It is a mode like Search, not a `View`: `state.docker_active` + `Exit::Docker` /
+  `Exit::Show(View)`. `View`, `View::other()` and the separated-pane code still assume two
+  views. Every path into Explorer/Search/SCM clears `docker_active` (`run_explorer`/`run_scm`
+  entry, `ensure::apply_activation`), so the flag can't outlive the view. Upstream builds
+  ignore the key.
+- The activity bar is one shared `ui::draw_activity_bar` (both apps used to carry a copy).
+- Battery rule: `docker ps` runs only while the Docker view is shown AND the pane is focused,
+  at most every 3 s, on a worker thread. `docker.rs` kills a command past its deadline
+  (list 10 s, start/stop/restart 60 s).
+- Running the fork: the version carries a `-docker.N` suffix so `scripts/fetch-or-build.sh`
+  finds no upstream asset and builds from source. `herdr plugin link` registers the path;
+  after changes run `cargo build --release`, then `herdr plugin action invoke
+  herdr-sidebar.redeploy`.
+- Right-click never reaches the pane unless `[ui] right_click_passthrough_modifier` is set
+  (see above); `m` opens the same menu.
+
 ## README screenshots (how-to)
 
 The framed screenshots in `plugins/herdr-sidebar/docs/media/` are produced with the
