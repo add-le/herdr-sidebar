@@ -97,6 +97,10 @@ pub enum Exit {
     },
     /// Switch to Explorer and open its Quick Open picker.
     QuickOpen,
+    /// Show the Docker view (Unified sidebar only).
+    Docker,
+    /// Leave the Docker view for Explorer or Source Control.
+    Show(View),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -325,6 +329,9 @@ pub struct State {
     pub custom_editor_on_click: bool,
     /// View mode in Source Control: true for hierarchical tree view, false for flat list view.
     pub scm_tree_view: bool,
+    /// Restore the Docker view when the unified sidebar is reopened. Like
+    /// Search, Docker is an activity of the unified pane, not a `View`.
+    pub docker_active: bool,
 }
 
 impl Default for State {
@@ -348,6 +355,7 @@ impl Default for State {
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
             scm_tree_view: false,
+            docker_active: false,
         }
     }
 }
@@ -513,10 +521,11 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"docker_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
+        state.docker_active,
         state.show_hotkeys,
         state.show_git_footer,
         state.font_prompt_done,
@@ -979,6 +988,10 @@ pub fn parse_state(json: &str) -> State {
             .get("scm_tree_view")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.scm_tree_view),
+        docker_active: value
+            .get("docker_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.docker_active),
     }
 }
 
@@ -1124,8 +1137,9 @@ mod tests {
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
             scm_tree_view: true,
+            docker_active: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"docker_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1184,6 +1198,12 @@ mod tests {
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
         assert!(parse_state("{\"scm_tree_view\":true}").scm_tree_view);
+    }
+
+    #[test]
+    fn docker_active_defaults_to_false_when_absent() {
+        let s = parse_state("{\"merged\":true,\"active\":\"explorer\"}");
+        assert!(!s.docker_active);
     }
 
     #[test]

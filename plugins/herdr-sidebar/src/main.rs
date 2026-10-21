@@ -7,6 +7,7 @@
 //! The native `--ensure` / `--toggle*` modes drive pane lifecycle; the other
 //! `--*` stdin→stdout helpers expose the unit-tested launch calculations.
 
+mod docker_app;
 mod explorer_app;
 mod scm_app;
 
@@ -270,16 +271,26 @@ fn main() -> std::io::Result<()> {
             .then_some(false)
     };
     let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
+    // Docker is an activity of the unified pane (like Search), not a View.
+    // A host-requested activity wins over the remembered one.
+    let mut docker_next = pinned.is_none()
+        && initial_activity.is_none()
+        && persisted.merged
+        && persisted.docker_active;
     let result = loop {
-        let exit = match view {
-            View::Explorer => run_explorer(
-                &mut terminal,
-                Rc::clone(&cwd_follower),
-                &mut roots,
-                std::mem::take(&mut search_on_open),
-                std::mem::take(&mut quick_open_on_open),
-            ),
-            View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
+        let exit = if std::mem::take(&mut docker_next) {
+            run_docker(&mut terminal)
+        } else {
+            match view {
+                View::Explorer => run_explorer(
+                    &mut terminal,
+                    Rc::clone(&cwd_follower),
+                    &mut roots,
+                    std::mem::take(&mut search_on_open),
+                    std::mem::take(&mut quick_open_on_open),
+                ),
+                View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
+            }
         };
         match exit {
             Ok(Exit::Quit) => {
@@ -298,6 +309,8 @@ fn main() -> std::io::Result<()> {
                 view = View::Explorer;
                 quick_open_on_open = true;
             }
+            Ok(Exit::Docker) => docker_next = true,
+            Ok(Exit::Show(next)) => view = next,
             Err(e) => {
                 roots.flush();
                 break Err(e);
@@ -595,6 +608,40 @@ fn run_scm(
             last_tick = std::time::Instant::now();
         }
         roots.record(app.root_path());
+    }
+}
+
+/// The Docker view's event loop: the Explorer's 500 ms poll and
+/// every-iteration heartbeat. It has no root, so `roots` is not involved;
+/// `docker ps` runs on the app's worker thread, collected by `tick`.
+fn run_docker(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
+    let mut app = docker_app::App::new();
+    loop {
+        app.heartbeat();
+        app.tick();
+        terminal.draw(|frame| app.draw(frame))?;
+        let timeout = if app.is_loading() {
+            ANIMATION_FRAME
+        } else {
+            Duration::from_millis(500)
+        };
+        if event::poll(timeout)? {
+            let exit = match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Resize(width, _) => {
+                    app.on_resize(width);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(exit) = exit {
+                if exit == Exit::Quit {
+                    app.clear_identity();
+                }
+                return Ok(exit);
+            }
+        }
     }
 }
 

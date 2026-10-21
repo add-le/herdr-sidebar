@@ -28,9 +28,9 @@ use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     ActivityHits, ActivityTab, TitleAction, chrome_button_style, draw_activity_bar, draw_scrollbar,
     gear_icon, hits, hits_collapse_button, hover_style, icon_style as ui_icon_style, input_tail,
-    keep_visible_scroll, palette, selection_style, set_color_theme, sibling_panes_of, status_color,
-    title_action_icon, title_action_spans, title_actions_visible, title_actions_width, truncate_to,
-    wrap_footer_message, wrap_hints,
+    keep_visible_scroll, palette, pane_focused_in, selection_style, set_color_theme,
+    sibling_panes_of, status_color, title_action_icon, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -920,8 +920,21 @@ impl App {
         self.sidebar_state = sidebar::update_state(|state| {
             state.active = view;
             state.search_active = false;
+            state.docker_active = false;
         });
         Some(Exit::Switch)
+    }
+
+    /// Show the Docker view (Unified sidebar only).
+    fn open_docker(&mut self) -> Option<Exit> {
+        if !self.merged() {
+            return None;
+        }
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.docker_active = true;
+            state.search_active = false;
+        });
+        Some(Exit::Docker)
     }
 
     /// Close the other panel's standalone pane in our tab, if one is open.
@@ -1040,7 +1053,8 @@ impl App {
             return None;
         }
         // View switching from the keyboard, VS Code's activity-bar order:
-        // 1 Explorer, 2 Search, 3 Source Control. Ctrl+1/2/3 always switch (an
+        // 1 Explorer, 2 Search, 3 Source Control, 4 Docker (Unified sidebar
+        // only; no host F-key injection). Ctrl+1/2/3 always switch (an
         // editor's group-focus chord), so they work even mid-word in a focused
         // search field. Bare 1/2/3 ALSO switch while the Search box is NOT
         // focused (its Results list) — the state you land in when switching to
@@ -1054,7 +1068,7 @@ impl App {
             _ => None,
         };
         if let Some(c) = injected_view.or(match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3')) => Some(c),
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => Some(c),
             _ => None,
         }) {
             let ctrl = injected_view.is_some()
@@ -1084,7 +1098,8 @@ impl App {
                         self.open_content_search(false);
                         None
                     }
-                    _ => self.switch_to(View::SourceControl),
+                    '3' => self.switch_to(View::SourceControl),
+                    _ => self.open_docker(),
                 };
             }
         }
@@ -1130,6 +1145,7 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('4') => return self.open_docker(),
             _ => {}
         }
         None
@@ -1161,8 +1177,8 @@ impl App {
                     Some(ActivityTab::SourceControl) => {
                         return self.switch_to(View::SourceControl);
                     }
-                    // Wired with the Docker view.
-                    Some(ActivityTab::Docker) | None => {}
+                    Some(ActivityTab::Docker) => return self.open_docker(),
+                    None => {}
                 }
             }
             let gear = self.gear;
@@ -4464,26 +4480,6 @@ fn truncate_path_tail(label: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
-    let Ok(value) =
-        serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return false;
-    };
-    value
-        .get("result")
-        .and_then(|result| result.get("panes"))
-        .and_then(|panes| panes.as_array())
-        .and_then(|panes| {
-            panes
-                .iter()
-                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
-        })
-        .and_then(|pane| pane.get("focused"))
-        .and_then(|focused| focused.as_bool())
-        .unwrap_or(false)
-}
-
 /// The right-aligned decoration for a status letter (issue #19): the letter
 /// itself for a file, a filled dot for a directory whose DESCENDANTS changed
 /// (VS Code's dirty-folder badge), and nothing at all for ignored paths —
@@ -4852,17 +4848,6 @@ mod tests {
             root.join("src")
         );
         assert_eq!(create_target_dir(None, root.clone()), root);
-    }
-
-    #[test]
-    fn focused_pane_detection_is_scoped_to_our_pane_id() {
-        let panes = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","focused":false},
-            {"pane_id":"w1:p2","focused":true}
-        ]}}"#;
-        assert!(!pane_focused_in(panes, "w1:p1"));
-        assert!(pane_focused_in(panes, "w1:p2"));
-        assert!(!pane_focused_in("garbage", "w1:p2"));
     }
 
     /// The rendered text of a row, decorations included.

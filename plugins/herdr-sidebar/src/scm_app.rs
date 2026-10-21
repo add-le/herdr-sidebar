@@ -33,9 +33,10 @@ use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     ActivityHits, ActivityTab, TitleAction, branch_icon, chrome_button_style, draw_activity_bar,
     draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
-    icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style, set_color_theme,
-    sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
-    title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
+    icon_style as ui_icon_style, keep_visible_scroll, palette, pane_focused_in, selection_style,
+    set_color_theme, sibling_panes_of, sparkle_icon, status_color, title_action_spans,
+    title_actions_visible, title_actions_width, truncate_to, within, wrap_footer_message,
+    wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -1631,8 +1632,8 @@ impl App {
         }
         // View switching has to reach past the commit message box, where bare
         // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
-        // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
-        // still switch from the file list.
+        // from any focus (1 Explorer, 2 Search, 3 Source Control, 4 Docker in
+        // the Unified sidebar). Bare 1/2/3/4 still switch from the file list.
         let injected_view = match key.code {
             KeyCode::F(9) => Some('1'),
             KeyCode::F(10) => Some('2'),
@@ -1640,7 +1641,7 @@ impl App {
             _ => None,
         };
         let keyboard_view = match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3'))
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4'))
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1653,7 +1654,8 @@ impl App {
             return match c {
                 '1' => self.switch_to(View::Explorer),
                 '2' => self.open_search(false),
-                _ => self.switch_to(View::SourceControl),
+                '3' => self.switch_to(View::SourceControl),
+                _ => self.open_docker(),
             };
         }
         if self.overlay.is_some() {
@@ -1764,6 +1766,7 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.open_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('4') => return self.open_docker(),
             _ => {}
         }
         None
@@ -1810,8 +1813,8 @@ impl App {
                 Some(ActivityTab::Explorer) => return self.switch_to(View::Explorer),
                 Some(ActivityTab::Search) => return self.open_search(false),
                 Some(ActivityTab::SourceControl) => return self.switch_to(View::SourceControl),
-                // Wired with the Docker view.
-                Some(ActivityTab::Docker) | None => {}
+                Some(ActivityTab::Docker) => return self.open_docker(),
+                None => {}
             }
         }
         if hits(z.gear, x, y) {
@@ -3490,8 +3493,21 @@ impl App {
         self.sidebar_state = sidebar::update_state(|state| {
             state.active = view;
             state.search_active = false;
+            state.docker_active = false;
         });
         Some(Exit::Switch)
+    }
+
+    /// Show the Docker view (Unified sidebar only).
+    fn open_docker(&mut self) -> Option<Exit> {
+        if !self.merged() {
+            return None;
+        }
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.docker_active = true;
+            state.search_active = false;
+        });
+        Some(Exit::Docker)
     }
 
     fn open_search(&mut self, focus_query: bool) -> Option<Exit> {
@@ -5381,26 +5397,6 @@ fn tree_dir_item(
     ListItem::new(Line::from(spans))
 }
 
-fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
-    let Ok(value) =
-        serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return false;
-    };
-    value
-        .get("result")
-        .and_then(|result| result.get("panes"))
-        .and_then(|panes| panes.as_array())
-        .and_then(|panes| {
-            panes
-                .iter()
-                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
-        })
-        .and_then(|pane| pane.get("focused"))
-        .and_then(|focused| focused.as_bool())
-        .unwrap_or(false)
-}
-
 fn no_repo_layout(area: Rect, merged: bool) -> [Rect; 2] {
     Layout::vertical([
         Constraint::Length(if merged { 3 } else { 0 }),
@@ -5558,16 +5554,6 @@ mod tests {
         let draft = ['d', 'r', 'a', 'f', 't'];
         assert!(!commit_draft_present([empty, empty]));
         assert!(commit_draft_present([empty, draft.as_slice()]));
-    }
-
-    #[test]
-    fn focused_pane_detection_is_scoped_to_our_pane_id() {
-        let panes = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","focused":false},
-            {"pane_id":"w1:p2","focused":true}
-        ]}}"#;
-        assert!(!pane_focused_in(panes, "w1:p1"));
-        assert!(pane_focused_in(panes, "w1:p2"));
     }
 
     #[test]

@@ -881,9 +881,42 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
         .collect()
 }
 
+/// Whether `pane_id` is the focused pane in a `pane.list` response. The
+/// sidebar views back their periodic refreshes off while it is not.
+pub fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
+    let Ok(value) =
+        serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
+    else {
+        return false;
+    };
+    value
+        .get("result")
+        .and_then(|result| result.get("panes"))
+        .and_then(|panes| panes.as_array())
+        .and_then(|panes| {
+            panes
+                .iter()
+                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
+        })
+        .and_then(|pane| pane.get("focused"))
+        .and_then(|focused| focused.as_bool())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focused_pane_detection_is_scoped_to_our_pane_id() {
+        let panes = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","focused":false},
+            {"pane_id":"w1:p2","focused":true}
+        ]}}"#;
+        assert!(!pane_focused_in(panes, "w1:p1"));
+        assert!(pane_focused_in(panes, "w1:p2"));
+        assert!(!pane_focused_in("garbage", "w1:p2"));
+    }
 
     /// Perceived brightness on a 0..1 scale, the measure `darken_for_light`
     /// caps.
