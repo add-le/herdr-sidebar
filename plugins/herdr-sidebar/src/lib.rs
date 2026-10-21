@@ -7,6 +7,7 @@ pub mod actions;
 pub mod ansi;
 pub mod branch_ui;
 pub mod diffview;
+pub mod docker;
 pub mod editor;
 pub mod ensure;
 pub mod fontsetup;
