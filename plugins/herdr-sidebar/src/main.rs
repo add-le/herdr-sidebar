@@ -259,8 +259,12 @@ fn main() -> std::io::Result<()> {
         pending: false,
         last_attempt: None,
     };
-    let (mut docker_next, mut search_on_open) =
-        startup_activity(pinned, initial_activity, &persisted);
+    let (mut docker_next, mut search_on_open) = startup_activity(
+        pinned,
+        initial_activity,
+        &persisted,
+        std::env::current_exe().is_ok(),
+    );
     let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
     let result = loop {
         let exit = if std::mem::take(&mut docker_next) {
@@ -317,12 +321,15 @@ fn startup_activity(
     pinned: Option<View>,
     initial: Option<ensure::Target>,
     persisted: &state::State,
+    can_split: bool,
 ) -> (bool, Option<bool>) {
     if initial == Some(ensure::Target::Search) {
         return (false, Some(false));
     }
     let unified = pinned.is_none() && initial.is_none() && persisted.merged;
-    if unified && persisted.docker_active {
+    // Docker needs what the apps' `merged()` needs: the merged flag AND an
+    // executable to spawn the other view from (else they run non-unified).
+    if unified && can_split && persisted.docker_active {
         return (true, None);
     }
     let search = unified && persisted.active == View::Explorer && persisted.search_active;
@@ -700,15 +707,20 @@ mod tests {
             docker_active: true,
             ..Default::default()
         };
-        assert_eq!(startup_activity(None, None, &persisted), (true, None));
+        assert_eq!(startup_activity(None, None, &persisted, true), (true, None));
+        // Without the other binary the apps aren't Unified: fall back to Explorer.
+        assert_eq!(
+            startup_activity(None, None, &persisted, false),
+            (false, Some(false))
+        );
         // A host-requested activity beats both remembered ones.
         assert_eq!(
-            startup_activity(None, Some(ensure::Target::Search), &persisted),
+            startup_activity(None, Some(ensure::Target::Search), &persisted, true),
             (false, Some(false))
         );
         // A pinned (separated) pane never opens Docker or Search.
         assert_eq!(
-            startup_activity(Some(View::Explorer), None, &persisted),
+            startup_activity(Some(View::Explorer), None, &persisted, true),
             (false, None)
         );
         let search_only = state::State {
@@ -716,7 +728,7 @@ mod tests {
             ..persisted
         };
         assert_eq!(
-            startup_activity(None, None, &search_only),
+            startup_activity(None, None, &search_only, true),
             (false, Some(false))
         );
     }

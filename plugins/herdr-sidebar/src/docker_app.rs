@@ -460,6 +460,17 @@ impl App {
         }
     }
 
+    /// Whether `row` is a group with a member in flight (its button shows `…`).
+    fn group_busy(&self, row: RowKind) -> bool {
+        match row {
+            RowKind::Group(g) => self.groups[g]
+                .containers
+                .iter()
+                .any(|c| self.busy.contains(&c.id)),
+            RowKind::Container(..) => false,
+        }
+    }
+
     fn run_on_row(&mut self, row: RowKind, action: Action) {
         let ids = targets(row, &self.groups);
         self.dispatch(action, ids);
@@ -588,8 +599,16 @@ impl App {
             return None;
         }
         if self.menu.is_some() {
-            self.menu_key(key.code);
-            return None;
+            // The host's injected F9-F12 and the view keys 1-4 still leave the
+            // view: they close the menu and fall through to the normal handling
+            // (state is already written for the injections).
+            let view_key = !key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::F(9..=12) | KeyCode::Char('1'..='4'));
+            if !view_key {
+                self.menu_key(key.code);
+                return None;
+            }
+            self.menu = None;
         }
         if (ctrl && key.code == KeyCode::Char('p')) || key.code == KeyCode::F(12) {
             return Some(leave(Exit::QuickOpen));
@@ -711,9 +730,16 @@ impl App {
                     self.snap = false;
                     let row = self.rows[index];
                     let column = x - self.body.x;
-                    if column < self.row_width && button_hit(self.row_width, column) {
-                        let action = self.row_action(row);
-                        self.run_on_row(row, action);
+                    // The scrollbar column is not part of any row.
+                    if column >= self.row_width {
+                        return None;
+                    }
+                    if button_hit(self.row_width, column) {
+                        // A group button showing `…` is inert (the menu still acts).
+                        if !self.group_busy(row) {
+                            let action = self.row_action(row);
+                            self.run_on_row(row, action);
+                        }
                     } else if let RowKind::Group(g) = row {
                         self.toggle_group(g);
                     }
@@ -752,8 +778,14 @@ impl App {
         self.page = usize::from(body.height.saturating_sub(1).max(1));
         self.start_button = Rect::default();
         match &self.screen {
-            None if self.notice.is_none() => message(frame, body, " Loading…"),
-            None => {}
+            None => match &self.notice {
+                None => message(frame, body, " Loading…"),
+                // The first list failed: say why in the body, not only below.
+                Some(text) => {
+                    let text = truncate_to(format!(" {text}"), usize::from(body.width));
+                    message(frame, body, &text);
+                }
+            },
             Some(Err(DockerError::NotInstalled)) => message(frame, body, " Docker CLI not found"),
             Some(Err(_)) => self.draw_daemon_down(frame, body),
             Some(Ok(())) if self.rows.is_empty() => message(frame, body, " No containers"),
@@ -881,7 +913,7 @@ impl App {
                 let line = match *row {
                     RowKind::Group(g) => {
                         let group = &self.groups[g];
-                        let busy = group.containers.iter().any(|c| self.busy.contains(&c.id));
+                        let busy = self.group_busy(*row);
                         group_line(group, !self.collapsed.contains(group.key()), width, busy)
                     }
                     RowKind::Container(g, c) => {
@@ -919,7 +951,7 @@ fn leave(exit: Exit) -> Exit {
     exit
 }
 
-fn message(frame: &mut Frame, area: Rect, text: &'static str) {
+fn message(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(Paragraph::new(text.dim()), area);
 }
 
@@ -1228,6 +1260,88 @@ d4\tda-redis\tredis/redis-stack-server:7.4.0-v3\trunning\tUp 2 minutes\ts3pweb-b
         assert_eq!(
             app.recorded.pop().map(|(a, ids)| (a, ids.len())),
             Some((Action::Stop, 3))
+        );
+    }
+
+    /// `leave` persists state: point it at a scratch dir, never the user's.
+    fn isolate_state() {
+        let dir =
+            std::env::temp_dir().join(format!("herdr-docker-app-test-{}", std::process::id()));
+        // SAFETY: only tests read this variable, and every writer stores the same value.
+        unsafe { std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir) };
+    }
+
+    #[test]
+    fn a_group_button_showing_busy_ignores_clicks() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        let button = (app.body.x + app.row_width - 1, app.body.y); // group 0, first row
+        assert!(
+            app.click_for_test(button.0, button.1).is_some(),
+            "idle group acts"
+        );
+        app.busy.clear();
+        app.dispatch(Action::Start, vec!["a1".to_string()]);
+        render_to_string(&mut app, 32, 20);
+        assert!(app.click_for_test(button.0, button.1).is_none());
+        assert!(
+            app.collapsed.is_empty(),
+            "and doesn't toggle the group either"
+        );
+        // the group is still selected; `x` acts on the members that are free
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(
+            app.recorded.pop().map(|(a, ids)| (a, ids.len())),
+            Some((Action::Stop, 2))
+        );
+    }
+
+    #[test]
+    fn clicking_the_scrollbar_column_does_not_toggle_a_group() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 9); // 6 rows in a 5-row body: overflows
+        assert_eq!(app.row_width, 31);
+        assert!(app.click_for_test(app.body.x + 31, app.body.y).is_none());
+        assert!(app.collapsed.is_empty());
+        // a click on the group's label still toggles it
+        app.click_for_test(app.body.x + 5, app.body.y);
+        assert_eq!(app.collapsed.len(), 1);
+    }
+
+    #[test]
+    fn host_view_keys_pass_through_an_open_menu() {
+        isolate_state();
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        let plain = app.on_key(KeyEvent::from(KeyCode::F(9)));
+        assert_eq!(plain, Some(Exit::Show(View::Explorer)));
+        for (code, expected) in [
+            (KeyCode::F(9), Exit::Show(View::Explorer)),
+            (KeyCode::F(11), Exit::Show(View::SourceControl)),
+            (KeyCode::Char('3'), Exit::Show(View::SourceControl)),
+            (KeyCode::F(12), Exit::QuickOpen),
+        ] {
+            app.on_key(KeyEvent::from(KeyCode::Char('m')));
+            assert!(app.menu.is_some());
+            assert_eq!(app.on_key(KeyEvent::from(code)), Some(expected));
+            assert!(app.menu.is_none(), "{code:?} closes the menu");
+        }
+        // other keys stay with the menu
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert_eq!(app.on_key(KeyEvent::from(KeyCode::Char('q'))), None);
+        assert!(app.menu.is_some());
+    }
+
+    #[test]
+    fn a_failed_first_list_shows_its_message_in_the_body() {
+        let mut app = App::for_test(Err(DockerError::Failed("docker ps timed out".into())));
+        let text = render_to_string(&mut app, 32, 12);
+        assert!(!text.contains("Loading"));
+        let body: Vec<&str> = text.lines().skip(4).take(7).collect();
+        assert!(
+            body.iter().any(|l| l.contains("docker ps timed out")),
+            "message is in the body, not only the notice: {body:?}"
         );
     }
 }

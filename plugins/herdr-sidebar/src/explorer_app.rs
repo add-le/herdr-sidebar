@@ -931,6 +931,9 @@ impl App {
         }
         self.sidebar_state = sidebar::update_state(|state| {
             state.docker_active = true;
+            // Docker's heartbeat stamps under Explorer; a stale `SourceControl`
+            // would make the next startup report the wrong identity.
+            state.active = View::Explorer;
             state.search_active = false;
         });
         Some(Exit::Docker)
