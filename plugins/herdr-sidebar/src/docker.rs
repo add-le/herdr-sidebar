@@ -272,6 +272,7 @@ mod tests {
         for s in [
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
             "error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/containers/json\": EOF",
+            "failed to connect to the docker API at unix:///Users/me/.docker/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /Users/me/.docker/run/docker.sock: connect: no such file or directory",
         ] {
             assert!(
                 matches!(classify_failure(s), DockerError::DaemonDown),
