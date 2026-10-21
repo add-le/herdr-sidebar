@@ -1,8 +1,16 @@
 //! Docker model: parse `docker ps` output and group containers by compose project.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long `docker ps` may take before the list attempt is abandoned.
+const LIST_DEADLINE: Duration = Duration::from_secs(10);
+/// How long start/stop/restart may take (a stop waits for the container's
+/// own shutdown grace period).
+const RUN_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ContainerState {
@@ -222,13 +230,11 @@ pub fn action_args(action: Action, ids: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn exec(args: &[String]) -> Result<String, DockerError> {
+fn exec(args: &[String], deadline: Duration) -> Result<String, DockerError> {
     let bin = docker_bin().ok_or(DockerError::NotInstalled)?;
-    let out = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| DockerError::Failed(e.to_string()))?;
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    let out = output_within(cmd, deadline)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -236,15 +242,71 @@ fn exec(args: &[String]) -> Result<String, DockerError> {
     }
 }
 
+/// `Command::output`, but a child still running at `deadline` is killed and
+/// reaped, and reported as `Failed`: a wedged daemon must not hold the
+/// caller's worker (and, with it, every later refresh) forever. Blocks; call
+/// from a worker thread. The pipes are drained on their own threads so a
+/// chatty child can't stall on a full pipe buffer.
+fn output_within(mut cmd: Command, deadline: Duration) -> Result<Output, DockerError> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| DockerError::Failed(e.to_string()))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(DockerError::Failed(format!(
+                    "docker didn't answer within {} s",
+                    deadline.as_secs_f32()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return Err(DockerError::Failed(e.to_string())),
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
 /// All containers (running or not). Blocks; call from a worker thread.
 pub fn list() -> Result<Vec<Container>, DockerError> {
     let args = ["ps", "-a", "--format", PS_FORMAT].map(String::from);
-    exec(&args).map(|out| parse_ps(&out))
+    exec(&args, LIST_DEADLINE).map(|out| parse_ps(&out))
 }
 
 /// Start/stop/restart containers. Blocks; call from a worker thread.
 pub fn run(action: Action, ids: &[String]) -> Result<(), DockerError> {
-    exec(&action_args(action, ids)).map(|_| ())
+    exec(&action_args(action, ids), RUN_DEADLINE).map(|_| ())
 }
 
 /// Launch Docker Desktop without waiting for it to finish starting.
@@ -266,6 +328,33 @@ pub fn start_desktop() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_past_its_deadline_is_killed_and_reported() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("5");
+        let result = output_within(cmd, Duration::from_millis(200));
+        assert_eq!(
+            result.map(|o| o.status.success()),
+            Err(DockerError::Failed(
+                "docker didn't answer within 0.2 s".into()
+            ))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "killed at the deadline, not waited for"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fast_command_finishes_within_its_deadline() {
+        let out = output_within(Command::new("/usr/bin/true"), Duration::from_secs(5))
+            .expect("true runs");
+        assert!(out.status.success());
+    }
 
     #[test]
     fn daemon_errors_are_classified_as_daemon_down() {

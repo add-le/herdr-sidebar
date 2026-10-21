@@ -188,7 +188,8 @@ impl App {
     }
 
     /// Collect a finished list; start the next one when forced, or when the
-    /// interval elapsed and the pane is focused.
+    /// interval elapsed and the pane is focused. A refresh forced while a list
+    /// is in flight stays pending and runs as soon as that list lands.
     pub fn tick(&mut self) {
         self.collect_list();
         if self.list_rx.is_some() {
@@ -204,11 +205,6 @@ impl App {
         if forced || self.pane_is_focused() {
             self.request_list();
         }
-    }
-
-    /// A list is in flight; the event loop polls faster to show it promptly.
-    pub fn is_loading(&self) -> bool {
-        self.list_rx.is_some()
     }
 
     /// The view draws from the frame size; nothing to re-layout here.
@@ -722,6 +718,17 @@ d4\tda-redis\tredis/redis-stack-server:7.4.0-v3\trunning\tUp 2 minutes\ts3pweb-b
         assert!(text.contains("■ da-mongo mongo:7.0.43"));
         assert!(text.contains("Individual containers"));
         assert_eq!(app.selected, None, "nothing selected until the user picks");
+    }
+
+    #[test]
+    fn a_refresh_asked_for_while_listing_runs_after_it() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.list_rx = Some(rx);
+        app.on_key(KeyEvent::from(KeyCode::F(5)));
+        app.tick();
+        assert!(app.list_rx.is_some(), "still the first list");
+        assert!(app.refresh_due, "F5 is remembered, not dropped");
     }
 
     #[test]

@@ -3493,7 +3493,6 @@ impl App {
         self.sidebar_state = sidebar::update_state(|state| {
             state.active = view;
             state.search_active = false;
-            state.docker_active = false;
         });
         Some(Exit::Switch)
     }

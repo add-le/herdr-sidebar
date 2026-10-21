@@ -713,7 +713,14 @@ fn activate_existing(pane_id: &str, target: Target) -> std::io::Result<()> {
 }
 
 fn prepare_activation(target: Target) {
-    crate::state::update_state(|state| match target {
+    crate::state::update_state(|state| apply_activation(state, target));
+}
+
+/// The remembered activity after a host show-*/quick-open request. Every
+/// target leaves the Docker view, which no host action opens.
+fn apply_activation(state: &mut crate::state::State, target: Target) {
+    state.docker_active = false;
+    match target {
         Target::Explorer | Target::QuickOpen => {
             state.active = View::Explorer;
             state.search_active = false;
@@ -726,7 +733,7 @@ fn prepare_activation(target: Target) {
             state.active = View::SourceControl;
             state.search_active = false;
         }
-    });
+    }
 }
 
 fn open(
@@ -934,6 +941,23 @@ fn must_wait_for_lock(explicit: bool, event_json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_host_activation_leaves_the_docker_view() {
+        for target in [
+            Target::Explorer,
+            Target::Search,
+            Target::SourceControl,
+            Target::QuickOpen,
+        ] {
+            let mut state = crate::state::State {
+                docker_active: true,
+                ..Default::default()
+            };
+            apply_activation(&mut state, target);
+            assert!(!state.docker_active, "{target:?}");
+        }
+    }
 
     /// A simulated herdr for `refresh_with`: panes are (id, tab, tokens).
     /// Sidebars in `closes` save and close themselves a few waits after

@@ -259,24 +259,9 @@ fn main() -> std::io::Result<()> {
         pending: false,
         last_attempt: None,
     };
-    // Some(focus_query) opens the Search view on the next Explorer render;
-    // None doesn't. A resumed search restores unfocused (a switch, not a find).
-    let mut search_on_open: Option<bool> = if initial_activity == Some(ensure::Target::Search) {
-        Some(false)
-    } else {
-        (pinned.is_none()
-            && persisted.merged
-            && persisted.active == View::Explorer
-            && persisted.search_active)
-            .then_some(false)
-    };
+    let (mut docker_next, mut search_on_open) =
+        startup_activity(pinned, initial_activity, &persisted);
     let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
-    // Docker is an activity of the unified pane (like Search), not a View.
-    // A host-requested activity wins over the remembered one.
-    let mut docker_next = pinned.is_none()
-        && initial_activity.is_none()
-        && persisted.merged
-        && persisted.docker_active;
     let result = loop {
         let exit = if std::mem::take(&mut docker_next) {
             run_docker(&mut terminal)
@@ -320,6 +305,37 @@ fn main() -> std::io::Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// The activity a new sidebar process opens on: whether to start in the
+/// Docker view, and `Some(focus_query)` to open Search on the first Explorer
+/// render. A host-requested activity wins over the remembered ones, and a
+/// remembered Docker view wins over a remembered Search (Docker is an
+/// activity of the unified pane, like Search, not a `View`). A resumed
+/// search restores unfocused (a switch, not a find).
+fn startup_activity(
+    pinned: Option<View>,
+    initial: Option<ensure::Target>,
+    persisted: &state::State,
+) -> (bool, Option<bool>) {
+    if initial == Some(ensure::Target::Search) {
+        return (false, Some(false));
+    }
+    let unified = pinned.is_none() && initial.is_none() && persisted.merged;
+    if unified && persisted.docker_active {
+        return (true, None);
+    }
+    let search = unified && persisted.active == View::Explorer && persisted.search_active;
+    (false, search.then_some(false))
+}
+
+/// Showing Explorer, Search or Source Control means Docker is no longer the
+/// remembered activity. Clearing it here, where those views start, covers
+/// every way of leaving Docker (keys, clicks, host actions, Search).
+fn leave_docker_activity() {
+    if state::load_state().docker_active {
+        state::update_state(|s| s.docker_active = false);
+    }
 }
 
 fn read_stdin() -> std::io::Result<String> {
@@ -523,6 +539,7 @@ fn run_explorer(
     search_on_open: Option<bool>,
     quick_open_on_open: bool,
 ) -> std::io::Result<Exit> {
+    leave_docker_activity();
     let mut app = explorer_app::App::new(roots.root.clone(), cwd_follower);
     if let Some(focus_query) = search_on_open {
         app.open_content_search(focus_query);
@@ -570,6 +587,7 @@ fn run_scm(
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
     roots: &mut RootMemory,
 ) -> std::io::Result<Exit> {
+    leave_docker_activity();
     let mut app = scm_app::App::new(roots.root.clone(), cwd_follower);
     let mut last_tick = std::time::Instant::now();
     loop {
@@ -613,19 +631,16 @@ fn run_scm(
 
 /// The Docker view's event loop: the Explorer's 500 ms poll and
 /// every-iteration heartbeat. It has no root, so `roots` is not involved;
-/// `docker ps` runs on the app's worker thread, collected by `tick`.
+/// `docker ps` runs on the app's worker thread, collected by `tick`. No
+/// faster poll while a list is in flight: a slow daemon must not turn the
+/// view into a busy redraw loop.
 fn run_docker(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
     let mut app = docker_app::App::new();
     loop {
         app.heartbeat();
         app.tick();
         terminal.draw(|frame| app.draw(frame))?;
-        let timeout = if app.is_loading() {
-            ANIMATION_FRAME
-        } else {
-            Duration::from_millis(500)
-        };
-        if event::poll(timeout)? {
+        if event::poll(Duration::from_millis(500))? {
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
@@ -674,6 +689,36 @@ mod tests {
             Some(remembered_root_key("sx-flow", Path::new("/dev/sx-flow")))
         );
         assert_eq!(roots.root, Path::new("/dev/GCP"));
+    }
+
+    #[test]
+    fn a_remembered_docker_view_wins_over_a_remembered_search() {
+        let persisted = state::State {
+            merged: true,
+            active: View::Explorer,
+            search_active: true,
+            docker_active: true,
+            ..Default::default()
+        };
+        assert_eq!(startup_activity(None, None, &persisted), (true, None));
+        // A host-requested activity beats both remembered ones.
+        assert_eq!(
+            startup_activity(None, Some(ensure::Target::Search), &persisted),
+            (false, Some(false))
+        );
+        // A pinned (separated) pane never opens Docker or Search.
+        assert_eq!(
+            startup_activity(Some(View::Explorer), None, &persisted),
+            (false, None)
+        );
+        let search_only = state::State {
+            docker_active: false,
+            ..persisted
+        };
+        assert_eq!(
+            startup_activity(None, None, &search_only),
+            (false, Some(false))
+        );
     }
 
     #[test]
