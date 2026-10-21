@@ -9,7 +9,7 @@
 //! periodic refresh also waits for the pane to be focused.
 
 use std::collections::BTreeSet;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -19,9 +19,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 
-use herdr_sidebar::docker::{self, Container, DockerError, Group};
+use herdr_sidebar::docker::{self, Action, Container, DockerError, Group};
 use herdr_sidebar::icons::IconTheme;
 use herdr_sidebar::state::{self as sidebar, Exit, View};
 use herdr_sidebar::ui::{
@@ -44,7 +44,14 @@ const START_DESKTOP: &str = "[ Start Docker Desktop ]";
 /// Container rows sit under their group's chevron.
 const CONTAINER_INDENT: &str = "   ";
 
+/// How long a failed action's message stays up (refreshes don't clear it).
+const NOTICE_FOR: Duration = Duration::from_secs(8);
+/// The button in the last cells of every row.
+const BUTTON_W: u16 = 3;
+
 type ListResult = Result<Vec<Container>, DockerError>;
+/// A finished start/stop/restart: the ids it covered, and how it went.
+type ActionDone = (Vec<String>, Result<(), DockerError>);
 
 /// One visible list row: a group header, or a container inside a group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +70,62 @@ fn visible_rows(groups: &[Group], collapsed: &BTreeSet<String>) -> Vec<RowKind> 
         }
     }
     rows
+}
+
+/// The action a group's button runs: stop when anything in it runs.
+fn group_action(group: &Group) -> Action {
+    if group.running() > 0 {
+        Action::Stop
+    } else {
+        Action::Start
+    }
+}
+
+/// What the menu of a row offers.
+fn menu_actions(row: RowKind, groups: &[Group]) -> Vec<Action> {
+    match row {
+        RowKind::Container(g, c) => {
+            if groups[g].containers[c].state.is_running() {
+                vec![Action::Stop, Action::Restart]
+            } else {
+                vec![Action::Start]
+            }
+        }
+        RowKind::Group(g) => {
+            let running = groups[g].running();
+            let mut actions = Vec::new();
+            if running < groups[g].containers.len() {
+                actions.push(Action::Start);
+            }
+            if running > 0 {
+                actions.extend([Action::Stop, Action::Restart]);
+            }
+            actions
+        }
+    }
+}
+
+/// The container ids an action on this row covers.
+fn targets(row: RowKind, groups: &[Group]) -> Vec<String> {
+    match row {
+        RowKind::Container(g, c) => vec![groups[g].containers[c].id.clone()],
+        RowKind::Group(g) => groups[g].containers.iter().map(|c| c.id.clone()).collect(),
+    }
+}
+
+/// Whether a click at row column `column` lands on the button.
+fn button_hit(width: u16, column: u16) -> bool {
+    column >= width.saturating_sub(BUTTON_W)
+}
+
+/// A popup of actions for one row (or group), opened by `m` or a right click.
+struct Menu {
+    actions: Vec<Action>,
+    ids: Vec<String>,
+    /// Top-left wanted by the opener; `draw` clamps it inside the pane.
+    anchor: (u16, u16),
+    selected: usize,
+    rect: Rect,
 }
 
 /// A row's identity across refreshes (indices shift when containers come and
@@ -91,9 +154,21 @@ pub struct App {
     snap: bool,
     page: usize,
     notice: Option<String>,
+    /// While set and in the future, a list refresh must not clear `notice`.
+    notice_until: Option<Instant>,
     list_rx: Option<Receiver<ListResult>>,
     /// Refresh on the next tick regardless of focus and interval.
     refresh_due: bool,
+    /// Container ids with a start/stop/restart in flight.
+    busy: BTreeSet<String>,
+    action_tx: Sender<ActionDone>,
+    action_rx: Receiver<ActionDone>,
+    menu: Option<Menu>,
+    /// Width of a list row (the pane minus the scrollbar column), from the last draw.
+    row_width: u16,
+    area: Rect,
+    #[cfg(test)]
+    recorded: Vec<(Action, Vec<String>)>,
     last_refresh: Instant,
     last_beat: Option<Instant>,
     mouse_pos: Option<(u16, u16)>,
@@ -127,6 +202,7 @@ impl App {
     }
 
     fn with(pane_id: Option<String>, theme: IconTheme) -> Self {
+        let (action_tx, action_rx) = std::sync::mpsc::channel();
         Self {
             pane_id,
             theme,
@@ -140,9 +216,18 @@ impl App {
             snap: false,
             page: 10,
             notice: None,
+            notice_until: None,
             list_rx: None,
             // The view was just opened: list right away.
             refresh_due: true,
+            busy: BTreeSet::new(),
+            action_tx,
+            action_rx,
+            menu: None,
+            row_width: 0,
+            area: Rect::default(),
+            #[cfg(test)]
+            recorded: Vec::new(),
             last_refresh: Instant::now(),
             last_beat: None,
             mouse_pos: None,
@@ -191,6 +276,11 @@ impl App {
     /// interval elapsed and the pane is focused. A refresh forced while a list
     /// is in flight stays pending and runs as soon as that list lands.
     pub fn tick(&mut self) {
+        self.collect_actions();
+        if self.notice_until.is_some_and(|t| Instant::now() >= t) {
+            self.notice_until = None;
+            self.notice = None;
+        }
         self.collect_list();
         if self.list_rx.is_some() {
             return;
@@ -230,6 +320,48 @@ impl App {
         }
     }
 
+    /// Collect finished actions: free their rows, list again at once, and
+    /// report a failure.
+    fn collect_actions(&mut self) {
+        while let Ok((ids, result)) = self.action_rx.try_recv() {
+            for id in &ids {
+                self.busy.remove(id);
+            }
+            self.refresh_due = true;
+            if let Err(error) = result {
+                self.notice = Some(match error {
+                    DockerError::Failed(message) => message,
+                    DockerError::DaemonDown => "Docker isn't running".into(),
+                    DockerError::NotInstalled => "Docker CLI not found".into(),
+                });
+                self.notice_until = Some(Instant::now() + NOTICE_FOR);
+            }
+        }
+    }
+
+    /// Run `action` on `ids` (minus those already busy) on a worker thread.
+    /// Never blocks: `docker::run` waits up to 60 s.
+    fn dispatch(&mut self, action: Action, ids: Vec<String>) {
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|id| !self.busy.contains(id))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.busy.extend(ids.iter().cloned());
+        #[cfg(test)]
+        self.recorded.push((action, ids));
+        #[cfg(not(test))]
+        {
+            let tx = self.action_tx.clone();
+            std::thread::spawn(move || {
+                let result = docker::run(action, &ids);
+                let _ = tx.send((ids, result));
+            });
+        }
+    }
+
     fn apply_list(&mut self, result: ListResult) {
         match result {
             Ok(containers) => {
@@ -237,7 +369,9 @@ impl App {
                 self.groups = docker::group(containers);
                 self.rebuild(keep);
                 self.screen = Some(Ok(()));
-                self.notice = None;
+                if self.notice_until.is_none() {
+                    self.notice = None;
+                }
             }
             // A transient failure keeps the last good list on screen.
             Err(DockerError::Failed(message)) => self.notice = Some(message),
@@ -311,6 +445,80 @@ impl App {
         self.rows.get(self.selected?).copied()
     }
 
+    /// The button's action for a row: a container's opposite state, a group's
+    /// `group_action`.
+    fn row_action(&self, row: RowKind) -> Action {
+        match row {
+            RowKind::Container(g, c) => {
+                if self.groups[g].containers[c].state.is_running() {
+                    Action::Stop
+                } else {
+                    Action::Start
+                }
+            }
+            RowKind::Group(g) => group_action(&self.groups[g]),
+        }
+    }
+
+    fn run_on_row(&mut self, row: RowKind, action: Action) {
+        let ids = targets(row, &self.groups);
+        self.dispatch(action, ids);
+    }
+
+    fn run_selected(&mut self, action: Action) {
+        if let Some(row) = self.selected_row() {
+            self.run_on_row(row, action);
+        }
+    }
+
+    fn open_menu(&mut self, row: RowKind, anchor: (u16, u16)) {
+        let actions = menu_actions(row, &self.groups);
+        if actions.is_empty() {
+            return;
+        }
+        self.menu = Some(Menu {
+            actions,
+            ids: targets(row, &self.groups),
+            anchor,
+            selected: 0,
+            rect: Rect::default(),
+        });
+    }
+
+    /// Keys while the menu is open: it owns the keyboard (Esc closes the
+    /// menu, never the view).
+    fn menu_key(&mut self, code: KeyCode) {
+        let Some(menu) = &mut self.menu else { return };
+        match code {
+            KeyCode::Esc => self.menu = None,
+            KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(menu.actions.len() - 1);
+            }
+            KeyCode::Enter => self.pick_menu(None),
+            _ => {}
+        }
+    }
+
+    /// Run the menu entry `index` (default: the highlighted one), then close.
+    fn pick_menu(&mut self, index: Option<usize>) {
+        if let Some(menu) = self.menu.take() {
+            let last = menu.actions.len() - 1;
+            let action = menu.actions[index.unwrap_or(menu.selected).min(last)];
+            self.dispatch(action, menu.ids);
+        }
+    }
+
+    /// The menu entry under a pane position, if it is inside the frame.
+    fn menu_entry_at(&self, x: u16, y: u16) -> Option<usize> {
+        let menu = self.menu.as_ref()?;
+        if !hits(menu.rect, x, y) {
+            return None;
+        }
+        let i = usize::from(y - menu.rect.y).checked_sub(1)?;
+        (i < menu.actions.len()).then_some(i)
+    }
+
     fn select(&mut self, index: usize) {
         if !self.rows.is_empty() {
             self.selected = Some(index.min(self.rows.len() - 1));
@@ -379,6 +587,10 @@ impl App {
             self.close();
             return None;
         }
+        if self.menu.is_some() {
+            self.menu_key(key.code);
+            return None;
+        }
         if (ctrl && key.code == KeyCode::Char('p')) || key.code == KeyCode::F(12) {
             return Some(leave(Exit::QuickOpen));
         }
@@ -429,6 +641,17 @@ impl App {
                 None => {}
             },
             KeyCode::F(5) | KeyCode::Char('r') => self.refresh_due = true,
+            KeyCode::Char('s') => self.run_selected(Action::Start),
+            KeyCode::Char('x') => self.run_selected(Action::Stop),
+            KeyCode::Char('m') => {
+                if let (Some(row), Some(sel)) = (self.selected_row(), self.selected) {
+                    // Just under the selected row.
+                    let line = sel
+                        .saturating_sub(self.scroll)
+                        .min(usize::from(self.body.height));
+                    self.open_menu(row, (self.body.x + 2, self.body.y + line as u16 + 1));
+                }
+            }
             _ => {}
         }
         None
@@ -437,7 +660,41 @@ impl App {
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
         let (x, y) = (mouse.column, mouse.row);
         self.mouse_pos = Some((x, y));
+        if self.menu.is_some() {
+            match mouse.kind {
+                MouseEventKind::Moved => {
+                    if let Some(i) = self.menu_entry_at(x, y)
+                        && let Some(menu) = &mut self.menu
+                    {
+                        menu.selected = i;
+                    }
+                    return None;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // A click outside only closes the menu; it doesn't also act.
+                    match self.menu_entry_at(x, y) {
+                        Some(i) => self.pick_menu(Some(i)),
+                        None => {
+                            if !self.menu.as_ref().is_some_and(|m| hits(m.rect, x, y)) {
+                                self.menu = None;
+                            }
+                        }
+                    }
+                    return None;
+                }
+                // A right click re-opens the menu on the row under it below.
+                MouseEventKind::Down(MouseButton::Right) => self.menu = None,
+                _ => {}
+            }
+        }
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(index) = self.row_at(x, y) {
+                    self.select(index);
+                    self.snap = false;
+                    self.open_menu(self.rows[index], (x, y));
+                }
+            }
             MouseEventKind::Moved => self.hovered = self.row_at(x, y),
             MouseEventKind::ScrollUp => self.scroll_view(-3),
             MouseEventKind::ScrollDown => self.scroll_view(3),
@@ -451,7 +708,13 @@ impl App {
                     self.start_desktop();
                 } else if let Some(index) = self.row_at(x, y) {
                     self.select(index);
-                    if let RowKind::Group(g) = self.rows[index] {
+                    self.snap = false;
+                    let row = self.rows[index];
+                    let column = x - self.body.x;
+                    if column < self.row_width && button_hit(self.row_width, column) {
+                        let action = self.row_action(row);
+                        self.run_on_row(row, action);
+                    } else if let RowKind::Group(g) = row {
                         self.toggle_group(g);
                     }
                 } else if hits(self.body, x, y) {
@@ -466,6 +729,7 @@ impl App {
     // ---- Drawing ----
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        self.area = frame.area();
         let notice_height = u16::from(self.notice.is_some());
         let [activity, header, body, notice] = Layout::vertical([
             Constraint::Length(3),
@@ -499,6 +763,53 @@ impl App {
             let line = truncate_to(format!(" {text}"), usize::from(notice.width));
             frame.render_widget(Paragraph::new(line.fg(palette().modified)), notice);
         }
+        self.draw_menu(frame);
+    }
+
+    /// The popup, clamped inside the pane.
+    fn draw_menu(&mut self, frame: &mut Frame) {
+        let area = self.area;
+        let Some(menu) = &mut self.menu else { return };
+        let label_w = menu
+            .actions
+            .iter()
+            .map(|a| a.label().len())
+            .max()
+            .unwrap_or(0) as u16;
+        let w = (label_w + 4).min(area.width);
+        let h = (menu.actions.len() as u16 + 2).min(area.height);
+        let x = menu
+            .anchor
+            .0
+            .min(area.right().saturating_sub(w))
+            .max(area.x);
+        let y = menu
+            .anchor
+            .1
+            .min(area.bottom().saturating_sub(h))
+            .max(area.y);
+        let rect = Rect::new(x, y, w, h);
+        menu.rect = rect;
+        frame.render_widget(Clear, rect);
+        let block = Block::bordered();
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let lines: Vec<Line> = menu
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let pad = usize::from(inner.width).saturating_sub(1);
+                let text = format!(" {:<pad$}", action.label());
+                let style = if i == menu.selected {
+                    selection_style(true)
+                } else {
+                    Style::default()
+                };
+                Line::styled(text, style)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
@@ -559,6 +870,7 @@ impl App {
         } else {
             area.width
         };
+        self.row_width = width;
         let items: Vec<ListItem> = self
             .rows
             .iter()
@@ -569,10 +881,13 @@ impl App {
                 let line = match *row {
                     RowKind::Group(g) => {
                         let group = &self.groups[g];
-                        group_line(group, !self.collapsed.contains(group.key()), width)
+                        let busy = group.containers.iter().any(|c| self.busy.contains(&c.id));
+                        group_line(group, !self.collapsed.contains(group.key()), width, busy)
                     }
                     RowKind::Container(g, c) => {
-                        container_line(&self.groups[g].containers[c], width)
+                        let container = &self.groups[g].containers[c];
+                        let busy = self.busy.contains(&container.id);
+                        Line::from(container_line(container, width, busy))
                     }
                 };
                 let item = ListItem::new(line);
@@ -608,36 +923,53 @@ fn message(frame: &mut Frame, area: Rect, text: &'static str) {
     frame.render_widget(Paragraph::new(text.dim()), area);
 }
 
-/// ` ▾ project            1/3 `: chevron, label, right-aligned running/total.
-fn group_line(group: &Group, expanded: bool, width: u16) -> Line<'static> {
+/// The button's 3 cells: stop when running, start when stopped, `…` while a
+/// command is in flight.
+fn button_span(running: bool, busy: bool) -> Span<'static> {
+    if busy {
+        Span::styled(" … ", Style::default().dim())
+    } else if running {
+        Span::styled(" ■ ", Style::default().fg(palette().deleted))
+    } else {
+        Span::styled(" ▶ ", Style::default().fg(palette().added))
+    }
+}
+
+/// ` ▾ project          1/3  ■ `: chevron, label, right-aligned
+/// running/total, then the group's button.
+fn group_line(group: &Group, expanded: bool, width: u16, busy: bool) -> Line<'static> {
     let chevron = if expanded { " ▾ " } else { " ▸ " };
-    let count = format!("{}/{} ", group.running(), group.containers.len());
-    let avail = usize::from(width).saturating_sub(Span::raw(chevron).width() + count.len() + 1);
+    let count = format!("{}/{}", group.running(), group.containers.len());
+    let right = count.len() + usize::from(BUTTON_W);
+    let avail = usize::from(width).saturating_sub(Span::raw(chevron).width() + right + 1);
     let label = truncate_to(group.label().to_string(), avail);
-    let pad = usize::from(width).saturating_sub(
-        Span::raw(chevron).width() + Span::raw(label.as_str()).width() + count.len(),
-    );
+    let pad = usize::from(width)
+        .saturating_sub(Span::raw(chevron).width() + Span::raw(label.as_str()).width() + right);
     Line::from(vec![
         Span::raw(chevron),
         Span::styled(label, Style::default().bold()),
         Span::raw(" ".repeat(pad)),
         Span::styled(count, Style::default().dim()),
+        button_span(group_action(group) == Action::Stop, busy),
     ])
 }
 
-/// `   ● name image`: state glyph, name, dimmed short image. The image yields
-/// first when the row is narrow.
-fn container_line(container: &Container, width: u16) -> Line<'static> {
-    let (glyph, color) = if container.state.is_running() {
+/// `   ● name image    ■ `: state glyph, name, dimmed short image, then the
+/// button in the last 3 cells. The image yields first when the row is narrow.
+fn container_line(container: &Container, width: u16, busy: bool) -> Vec<Span<'static>> {
+    let running = container.state.is_running();
+    let (glyph, color) = if running {
         ("●", palette().added)
     } else {
         ("■", palette().deleted)
     };
     let fixed = CONTAINER_INDENT.len() + 2;
-    let avail = usize::from(width).saturating_sub(fixed + 1);
+    let avail = usize::from(width).saturating_sub(fixed + usize::from(BUTTON_W) + 1);
     let name = truncate_to(container.name.clone(), avail);
-    let left = avail.saturating_sub(Span::raw(name.as_str()).width() + 1);
+    let name_w = Span::raw(name.as_str()).width();
+    let left = avail.saturating_sub(name_w + 1);
     let image = truncate_to(docker::short_image(&container.image), left);
+    let mut used = fixed + name_w;
     let mut spans = vec![
         Span::raw(CONTAINER_INDENT),
         Span::styled(glyph, Style::default().fg(color)),
@@ -645,10 +977,45 @@ fn container_line(container: &Container, width: u16) -> Line<'static> {
         Span::raw(name),
     ];
     if !image.is_empty() {
+        used += 1 + Span::raw(image.as_str()).width();
         spans.push(Span::raw(" "));
         spans.push(Span::styled(image, Style::default().dim()));
     }
-    Line::from(spans)
+    let pad = usize::from(width).saturating_sub(used + usize::from(BUTTON_W));
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(button_span(running, busy));
+    spans
+}
+
+#[cfg(test)]
+impl App {
+    /// The (column, row) of the button of the container named `name`, from the
+    /// last draw.
+    fn button_cell_for_test(&self, name: &str) -> (u16, u16) {
+        let index = self
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(*r, RowKind::Container(g, c) if self.groups[g].containers[c].name == name)
+            })
+            .expect("container is listed");
+        (
+            self.body.x + self.row_width - 1,
+            self.body.y + (index - self.scroll) as u16,
+        )
+    }
+
+    /// A left click; returns what it queued instead of spawning.
+    fn click_for_test(&mut self, x: u16, y: u16) -> Option<(Action, Vec<String>)> {
+        self.recorded.clear();
+        self.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        self.recorded.pop()
+    }
 }
 
 #[cfg(test)]
@@ -737,5 +1104,130 @@ d4\tda-redis\tredis/redis-stack-server:7.4.0-v3\trunning\tUp 2 minutes\ts3pweb-b
         let text = render_to_string(&mut app, 32, 20);
         assert!(text.contains("Docker isn't running"));
         assert!(text.contains("Start Docker Desktop"));
+    }
+
+    #[test]
+    fn container_line_keeps_the_button_at_the_right_edge() {
+        let c = &groups()[1].containers[0]; // s3pweb-redis-stack, running
+        let line = Line::from(container_line(c, 32, false));
+        assert_eq!(line.width(), 32);
+        assert!(line.to_string().ends_with(" ■ "));
+        let narrow = Line::from(container_line(c, 16, false));
+        assert_eq!(narrow.width(), 16);
+        assert!(narrow.to_string().ends_with(" ■ "));
+        assert!(
+            Line::from(container_line(c, 32, true))
+                .to_string()
+                .ends_with(" … ")
+        );
+    }
+
+    #[test]
+    fn button_hit_is_the_last_three_cells() {
+        assert!(button_hit(32, 29) && button_hit(32, 31));
+        assert!(!button_hit(32, 28));
+    }
+
+    #[test]
+    fn menus_offer_what_applies() {
+        let g = groups();
+        assert_eq!(
+            menu_actions(RowKind::Container(1, 0), &g),
+            [Action::Stop, Action::Restart]
+        );
+        assert_eq!(menu_actions(RowKind::Container(0, 2), &g), [Action::Start]);
+        assert_eq!(
+            menu_actions(RowKind::Group(0), &g),
+            [Action::Start, Action::Stop, Action::Restart]
+        );
+        assert_eq!(group_action(&g[0]), Action::Stop);
+        assert_eq!(targets(RowKind::Group(0), &g).len(), 3);
+    }
+
+    #[test]
+    fn busy_container_ignores_a_second_click() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        let (col, row) = app.button_cell_for_test("s3pweb-redis-stack");
+        assert!(app.click_for_test(col, row).is_some()); // first click queues Stop
+        assert!(app.click_for_test(col, row).is_none()); // second is ignored while busy
+    }
+
+    #[test]
+    fn a_finished_action_frees_the_row_and_reports_failure() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        let (col, row) = app.button_cell_for_test("s3pweb-redis-stack");
+        let (action, ids) = app.click_for_test(col, row).unwrap();
+        assert_eq!(
+            (action, ids.clone()),
+            (Action::Stop, vec!["b2".to_string()])
+        );
+        app.action_tx
+            .send((ids, Err(DockerError::Failed("boom".into()))))
+            .unwrap();
+        app.collect_actions(); // not tick(): that would start a real `docker ps`
+        assert!(app.busy.is_empty());
+        assert!(app.refresh_due);
+        assert_eq!(app.notice.as_deref(), Some("boom"));
+        // the forced refresh landing must not wipe the message
+        app.apply_list(Ok(parse_ps(PS)));
+        assert_eq!(app.notice.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn right_click_menu_runs_an_entry_and_esc_only_closes_it() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        let (_, row) = app.button_cell_for_test("s3pweb-redis-stack");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let text = render_to_string(&mut app, 32, 20);
+        assert!(text.contains("Restart"));
+        assert!(app.on_key(KeyEvent::from(KeyCode::Esc)).is_none());
+        assert!(app.menu.is_none());
+        // `m` on the selection opens the same menu; Down + Enter picks Restart
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        render_to_string(&mut app, 32, 20);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.recorded.pop(),
+            Some((Action::Restart, vec!["b2".to_string()]))
+        );
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn click_outside_closes_the_menu_without_acting() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        let (col, row) = app.button_cell_for_test("s3pweb-redis-stack");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        render_to_string(&mut app, 32, 20);
+        assert!(app.menu.is_some());
+        assert!(app.click_for_test(col, 19).is_none());
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn s_and_x_act_on_the_selected_group() {
+        let mut app = App::for_test(Ok(parse_ps(PS)));
+        render_to_string(&mut app, 32, 20);
+        app.on_key(KeyEvent::from(KeyCode::Down)); // first group
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(
+            app.recorded.pop().map(|(a, ids)| (a, ids.len())),
+            Some((Action::Stop, 3))
+        );
     }
 }
